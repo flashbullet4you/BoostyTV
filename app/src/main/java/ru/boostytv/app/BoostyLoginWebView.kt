@@ -63,11 +63,21 @@ import java.net.URLDecoder
  */
 
 private const val HOME_URL = "https://boosty.to/"
-/** Прямая ссылка страницы входа Boosty — не зависит от кнопок на главной. */
-private const val LOGIN_URL = "https://boosty.to/signin"
+/**
+ * Страница входа. Пробуем оба известных адреса: Boosty менял их со временем,
+ * а на продвинутых аккаунтах /signin может редиректить не туда (в т.ч. на чужие
+ * страницы) — тогда переключаемся на англоязычный вариант.
+ */
+private val LOGIN_URLS = listOf("https://boosty.to/signin", "https://boosty.to/login")
 private const val COOKIE_HOST = "https://boosty.to"
 private const val TAG = "BoostyLogin"
 private const val POLL_INTERVAL_MS = 800L
+
+/** Признак страницы входа по URL (оба варианта). */
+private fun isLoginPage(url: String?): Boolean {
+    val u = url?.lowercase().orEmpty()
+    return u.contains("/signin") || u.contains("/login")
+}
 
 /**
  * Состояние автонавигации ко входу. Хранится отдельно от WebView, чтобы:
@@ -79,8 +89,16 @@ private class LoginNavState {
         private set
     var autoStarted = false                  // автоскролл/клики запущены хотя бы раз
     var retries = 0                          // попытки достучаться до boosty.to
+    var loginUrlIndex = 0                    // текущий адрес страницы входа из LOGIN_URLS
 
     fun set(p: String) { if (phase != p) phase = p }
+
+    /** Следующий кандидат адреса входа (/signin → /login); после конца списка — стоп. */
+    fun advanceLoginUrl(): Boolean {
+        if (loginUrlIndex + 1 >= LOGIN_URLS.size) return false
+        loginUrlIndex++
+        return true
+    }
 }
 
 /** Удаляет cookie авторизации Boosty — чтобы «Выйти» действительно завершал сессию на WebView. */
@@ -99,7 +117,8 @@ object BoostyLogin {
 /**
  * Шаги входа на странице /signin: закрыть cookie-баннер → выбрать «Войти через VK ID».
  * Возвращает "done", когда страница VK ID открылась — именно там сайт показывает QR-код.
- * Если по какой-то причине попали на главную (редирект), кликом «Войти» возвращаемся ко входу.
+ * Если по какой-то причине попали не на страницу входа (редирект на главную или на
+ * чужую страницу авторизатора), возвращаемся ко входу напрямую по адресу /signin.
  */
 private const val AUTO_OPEN_LOGIN_JS = """
 (function(){
@@ -117,10 +136,13 @@ private const val AUTO_OPEN_LOGIN_JS = """
   if((document.body.innerText||'').indexOf('QR-код')>-1 ||
      (document.body.innerText||'').indexOf('Отсканируйте')>-1) return 'done';
   var c=byText(/^я согласен$/); if(c){ c.click(); return 'step'; }
-  // На главной (не /signin): пробуем открыть окно входа кликом «Войти»,
-  // иначе — переходим на страницу входа напрямую.
+  // На главной кликом «Войти» открываем окно входа, иначе — идём на /signin напрямую.
   if(location.pathname==='/' || location.pathname===''){
-    var l=byText(/^войти$|^вход$/); if(l){ l.click(); return 'step'; }
+    var l=byText(/^войти$|^вход$|^log in$|^login$/); if(l){ l.click(); return 'step'; }
+    location.href='https://boosty.to/signin'; return 'nav';
+  }
+  // Редирект на чужую страницу (не вход и не VK ID) — возвращаемся ко входу напрямую.
+  if(url.indexOf('/signin')===-1 && url.indexOf('/login')===-1){
     location.href='https://boosty.to/signin'; return 'nav';
   }
   // Шаг: на странице входа выбираем способ «через VK ID».
@@ -157,6 +179,16 @@ private fun configure(webView: WebView) {
         setAcceptCookie(true)
         setAcceptThirdPartyCookies(webView, true)
     }
+}
+
+/**
+ * Инжектирует D-pad-скрипт (TvFocus) в страницу и забирает Android-фокус на WebView,
+ * чтобы стрелки ВЛЕВО/ВПРАВО и OK обрабатывались двухмерной навигацией, а не только
+ * вертикальным скроллом. Вызывается при каждой загрузке страницы — после навигации
+ * скрипт в странице теряется и нужен повторный впрыск.
+ */
+private fun attachDpad(view: WebView) {
+    TvWebView.attachDpad(view)
 }
 
 /**
@@ -281,7 +313,7 @@ fun BoostyLoginWebView(
                             nav.set(
                                 when {
                                     u.contains("id.vk.com") || u.contains("oauth.vk.com") -> "vkid"
-                                    u.contains("/signin") -> "login"
+                                    isLoginPage(u) -> "login"
                                     u.startsWith(COOKIE_HOST) -> "home"
                                     else -> nav.phase
                                 },
@@ -314,8 +346,20 @@ fun BoostyLoginWebView(
                         override fun onPageFinished(view: WebView, url: String?) {
                             Log.d(TAG, "загружено: $url")
                             loadProgress = -1
-                            if (url != null && url.startsWith(COOKIE_HOST)) startAutoLoginOnce(view, nav)
-                            else if (url != null && (url.contains("id.vk.com") || url.contains("oauth.vk.com"))) {
+                            // D-pad (стрелки влево/вправо и OK) — после каждой загрузки страницы.
+                            attachDpad(view)
+                            if (url != null && url.startsWith(COOKIE_HOST)) {
+                                // Редирект /signin на чужую страницу (например, профиль автора):
+                                // пробуем следующий известный адрес входа; когда варианты кончатся,
+                                // автоскрипт в JS сам вернёт нас на /signin.
+                                if (!isLoginPage(url) && !url.equals(HOME_URL, ignoreCase = true) &&
+                                    nav.advanceLoginUrl()) {
+                                    Log.w(TAG, "$url — не страница входа, пробуем ${LOGIN_URLS[nav.loginUrlIndex]}")
+                                    view.loadUrl(LOGIN_URLS[nav.loginUrlIndex])
+                                    return
+                                }
+                                startAutoLoginOnce(view, nav)
+                            } else if (url != null && (url.contains("id.vk.com") || url.contains("oauth.vk.com"))) {
                                 nav.set("vkid")
                                 Log.d(TAG, "страница VK ID: ждём QR")
                             }
@@ -329,7 +373,7 @@ fun BoostyLoginWebView(
                             nav.retries++
                             view.postDelayed({
                                 loadProgress = nav.retries
-                                view.loadUrl(LOGIN_URL)
+                                view.loadUrl(LOGIN_URLS[nav.loginUrlIndex])
                             }, 2_000L * nav.retries)
                         }
                     }
@@ -358,6 +402,8 @@ fun BoostyLoginWebView(
                                 override fun onPageFinished(view: WebView, url: String?) {
                                     Log.d(TAG, "popup загружено: $url")
                                     if (url != null) nav.set("popup")
+                                    // В popup-окне тоже нужен D-pad: стрелки и OK.
+                                    attachDpad(view)
                                 }
                             }
                             child.webChromeClient = object : WebChromeClient() {
@@ -373,9 +419,10 @@ fun BoostyLoginWebView(
                         }
                     }
                     // На Android TV WebView принимает фокус с пульта (D-pad):
-                    // навигация по элементам страницы работает стандартным способом.
+                    // двухмерную навигацию по элементам обеспечивает скрипт TvFocus,
+                    // который впрыскивается при каждой загрузке страницы.
                     // Сразу страница входа — без главной ленты Boosty.
-                    loadUrl(LOGIN_URL)
+                    loadUrl(LOGIN_URLS[0])
                     post { requestFocus() }
                 }
             },
@@ -464,7 +511,8 @@ private fun loginHintText(phase: String, loadProgress: Int): String = when {
         "Подтвердите вход в приложении VK или браузере на телефоне — " +
             "Boosty TV сохранит ваш аккаунт автоматически."
     phase == "login" ->
-        "Выбираем «Войти через VK ID»… Если кнопка не нажалась, нажмите её на пульте."
+        "Выбираем «Войти через VK ID»… Если кнопка не нажалась, стрелками пульта " +
+            "(вверх/вниз/влево/вправо) подсветите её и нажмите ОК."
     phase == "home" ->
         "Открываем страницу входа…"
     else ->

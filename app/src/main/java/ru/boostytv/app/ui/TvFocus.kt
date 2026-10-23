@@ -35,6 +35,8 @@ import android.webkit.WebViewClient
 private const val TV_FOCUS_SCRIPT = """
 (function () {
   // Установка идемпотентна: скрипт можно вливать при каждой загрузке страницы.
+  // При перезагрузке window.__tvKey исчезает вместе со страницей — обработчики
+  // keydown навешиваются заново на новый document.
   if (window.__tvKey) { return; }
 
   var SEL = 'a[href],button,input,select,textarea,[role="button"],[tabindex],[onclick],iframe';
@@ -231,12 +233,19 @@ private const val TV_FOCUS_SCRIPT = """
   window.__tvKey = function (dir) {
     var el = document.activeElement;
     var tag = el && el.tagName ? el.tagName.toLowerCase() : '';
+    var typing = (tag === 'input' || tag === 'textarea' || tag === 'select');
+
+    // Нативный фокус браузера на реальном кнопочном элементе страницы:
+    // штатная клавиатурная навигация сама переходит между соседними элементами,
+    // поэтому все стрелки и OK отдаём браузеру — ничего не кликаем и не скроллим
+    // в обход видимой подсветки. Если же браузер никуда не перешёл (SPA без
+    // tabindex), активным остаётся <body> и ниже включается наша навигация.
+    if (el && t_isFocusableUI(el)) { return 'native'; }
 
     // Фокус внутри фрейма — виджет входа VK ID. Кнопки за его пределами нам
     // недоступны, навигацией внутри фрейма занимается сам браузер.
     if (tag === 'iframe') { return 'native'; }
 
-    var typing = (tag === 'input' || tag === 'textarea' || tag === 'select');
     if (typing) {
       if (dir === 'left' || dir === 'right') { caret(el, dir); return 'handled'; }
       if (dir === 'ok') {
@@ -244,12 +253,24 @@ private const val TV_FOCUS_SCRIPT = """
         try { if (el.form) { el.form.requestSubmit(); } } catch (e) { }
         return 'handled';
       }
+      move(dir);
+      return 'handled';
     }
 
     if (dir === 'ok') { return press(); }
     move(dir);
     return 'handled';
   };
+
+  function t_isFocusableUI(el) {
+    try {
+      if (el === document.body || el === document.documentElement) { return false; }
+      var t = (el.tagName || '').toLowerCase();
+      if (t === 'iframe') { return false; }
+      return /^(a|button|input|select|textarea)$/.test(t) || el.getAttribute('tabindex') != null ||
+             el.getAttribute('role') === 'button';
+    } catch (e) { return false; }
+  }
 })();
 """
 
@@ -260,7 +281,22 @@ private const val TV_FOCUS_SCRIPT = """
  * перейти по фокусу или отдать клавишу браузеру) принимает скрипт в странице.
  */
 class TvWebView(context: Context) : WebView(context) {
-    companion object { var current: TvWebView? = null }
+    companion object {
+        var current: TvWebView? = null
+            private set
+
+        /**
+         * Инжектирует D-pad-скрипт в произвольный WebView (например, во popup-окно
+         * на экране входа) и включает Android-фокус, чтобы клавиши с пульта доходили
+         * до него, а не терялись в Compose.
+         */
+        fun attachDpad(webView: WebView) {
+            webView.isFocusable = true
+            webView.isFocusableInTouchMode = true
+            webView.evaluateJavascript(TV_FOCUS_SCRIPT, null)
+            webView.post { webView.requestFocus() }
+        }
+    }
 
     /** Повторная отправка клавиши браузеру — защита от рекурсии. */
     private var redispatching = false
