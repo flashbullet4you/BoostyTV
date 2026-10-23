@@ -289,12 +289,16 @@ class TvWebView(context: Context) : WebView(context) {
          * Инжектирует D-pad-скрипт в произвольный WebView (например, во popup-окно
          * на экране входа) и включает Android-фокус, чтобы клавиши с пульта доходили
          * до него, а не терялись в Compose.
+         *
+         * `requestFocus=false` используется для popup-окон: запрос фокуса у дочернего
+         * WebView может быть перехвачен основным WebView экрана входа — тот забирает
+         * фокус себе и перезагрузкой сбрасывает начатый вход (QR-код исчезал).
          */
-        fun attachDpad(webView: WebView) {
+        fun attachDpad(webView: WebView, requestFocus: Boolean = true) {
             webView.isFocusable = true
             webView.isFocusableInTouchMode = true
             webView.evaluateJavascript(TV_FOCUS_SCRIPT, null)
-            webView.post { webView.requestFocus() }
+            if (requestFocus) webView.post { webView.requestFocus() }
         }
     }
 
