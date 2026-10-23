@@ -7,7 +7,33 @@ data class VideoItem(
     val description: String,
     val videoUrl: String?,
     val postUrl: String,
-    val accessLabel: String
+    val accessLabel: String,
+    val coverUrl: String? = null,
+    val isPrivate: Boolean = false,
+    val likesCount: Int = 0,
+    val commentsCount: Int = 0,
+)
+
+/** Профиль пользователя Boosty, полученный из /v1/user. */
+data class UserProfile(
+    val name: String,
+    val email: String?,
+    val hasSubscriptions: Boolean,
+)
+
+/** Комментарий к публикации. */
+data class PostComment(
+    val id: String,
+    val authorName: String,
+    val text: String,
+    val createdAt: String,
+    val isMine: Boolean,
+)
+
+/** Реакция (лайк) на публикацию. */
+data class LikeInfo(
+    val liked: Boolean,
+    val count: Int,
 )
 
 object DemoCatalog {

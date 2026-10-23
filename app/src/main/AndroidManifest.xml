@@ -3,6 +3,13 @@
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Для входа через VK ID: если на телевизоре установлено приложение VK,
+         браузер внутри WebView сможет открыть его по схеме vk:// -->
+    <queries>
+        <package android:name="com.vk.id" />
+        <package android:name="com.vkontakte.android" />
+    </queries>
+
     <application
         android:allowBackup="false"
         android:label="Boosty TV"
