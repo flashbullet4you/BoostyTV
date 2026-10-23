@@ -14,10 +14,14 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -44,10 +48,11 @@ import java.net.URLDecoder
  * Вход на Boosty через VK ID по QR-коду — внутри приложения, без внешнего браузера.
  *
  * Сценарий («каждый смотрит свои подписки со своего аккаунта»):
- * 1. WebView открывает boosty.to с десктопным User-Agent (в мобильной версии вход по QR недоступен).
- * 2. Приложение само нажимает «Войти», затем «Продолжить с VK ID»; страница VK ID показывает QR-код.
- * 3. Пользователь сканирует QR телефоном (приложение VK или браузер) и подтверждает вход.
- * 4. Сайт дописывает cookie "auth"/"_clientId"; приложение перехватывает их и сохраняет в [TokenStore].
+ * 1. WebView открывает сразу страницу входа boosty.to/signin (не главную).
+ * 2. Если страница не загрузилась — автоматические повторные попытки с индикатором прогресса.
+ * 3. На странице входа приложение само выбирает «Войти через VK ID»; id.vk.com показывает QR-код.
+ * 4. Пользователь сканирует QR телефоном (приложение VK или браузер) и подтверждает вход.
+ * 5. Сайт дописывает cookie "auth"/"_clientId"; приложение перехватывает их и сохраняет в [TokenStore].
  *
  * Поддерживаются popup-окна (onCreateWindow): вход через соцсеть может открываться во всплывающем
  * окне — оно показывается поверх основной страницы и закрывается, когда сайт его закроет.
@@ -57,10 +62,26 @@ import java.net.URLDecoder
  * могут измениться; смотрите Logcat, тег BoostyLogin.
  */
 
-private const val LOGIN_URL = "https://boosty.to/"
+private const val HOME_URL = "https://boosty.to/"
+/** Прямая ссылка страницы входа Boosty — не зависит от кнопок на главной. */
+private const val LOGIN_URL = "https://boosty.to/signin"
 private const val COOKIE_HOST = "https://boosty.to"
 private const val TAG = "BoostyLogin"
 private const val POLL_INTERVAL_MS = 800L
+
+/**
+ * Состояние автонавигации ко входу. Хранится отдельно от WebView, чтобы:
+ * - не запускать цикл JS-кликов повторно после каждой пересборки Compose;
+ * - понимать, на какой странице мы находимся (для текста подсказки внизу экрана).
+ */
+private class LoginNavState {
+    var phase by mutableStateOf("loading")   // loading | home | login | vkid | popup
+        private set
+    var autoStarted = false                  // автоскролл/клики запущены хотя бы раз
+    var retries = 0                          // попытки достучаться до boosty.to
+
+    fun set(p: String) { if (phase != p) phase = p }
+}
 
 /** Удаляет cookie авторизации Boosty — чтобы «Выйти» действительно завершал сессию на WebView. */
 object BoostyLogin {
@@ -76,10 +97,9 @@ object BoostyLogin {
 }
 
 /**
- * Шаги входа: закрыть cookie-баннер → нажать «Войти» → выбрать вход через VK ID.
- * Каждый шаг выполняется только когда предыдущий завершён (ищем элементы по текстам),
- * поэтому повторные вызовы безопасны. Возвращает "done", когда страница VK ID открылась —
- * именно там сайт показывает QR-код для сканирования телефоном.
+ * Шаги входа на странице /signin: закрыть cookie-баннер → выбрать «Войти через VK ID».
+ * Возвращает "done", когда страница VK ID открылась — именно там сайт показывает QR-код.
+ * Если по какой-то причине попали на главную (редирект), кликом «Войти» возвращаемся ко входу.
  */
 private const val AUTO_OPEN_LOGIN_JS = """
 (function(){
@@ -93,17 +113,19 @@ private const val AUTO_OPEN_LOGIN_JS = """
   }
   var url=(location.href||'').toLowerCase();
   // Мы уже на странице VK ID (id.vk.com) — QR-код показывается там.
-  if(url.indexOf('id.vk.com')>-1 || (url.indexOf('/auth')>-1 && url.indexOf('boosty')===-1)) return 'done';
+  if(url.indexOf('id.vk.com')>-1 || url.indexOf('oauth.vk.com')>-1) return 'done';
   if((document.body.innerText||'').indexOf('QR-код')>-1 ||
      (document.body.innerText||'').indexOf('Отсканируйте')>-1) return 'done';
   var c=byText(/^я согласен$/); if(c){ c.click(); return 'step'; }
-  // Шаг 3: в окне входа выбираем способ «через VK ID».
-  var vk=byText(/vk\s?id|вконтакте|vk\.ru/);
-  if(vk && byText(/^войти$/)){ vk.click(); return 'step'; }
-  // Шаг 2: открываем само окно входа.
-  if(!(document.body.innerText||'').includes('Вход и регистрация')){
-    var l=byText(/^войти$/); if(l){ l.click(); return 'step'; }
+  // На главной (не /signin): пробуем открыть окно входа кликом «Войти»,
+  // иначе — переходим на страницу входа напрямую.
+  if(location.pathname==='/' || location.pathname===''){
+    var l=byText(/^войти$|^вход$/); if(l){ l.click(); return 'step'; }
+    location.href='https://boosty.to/signin'; return 'nav';
   }
+  // Шаг: на странице входа выбираем способ «через VK ID».
+  var vk=byText(/vk\s?id|вконтакте|vk\.ru/);
+  if(vk){ vk.click(); return 'step'; }
   return 'wait';
 })()
 """
@@ -140,17 +162,29 @@ private fun configure(webView: WebView) {
 /**
  * Раз в POLL_INTERVAL_MS пытается пройти шаги входа, пока не откроется страница VK ID с QR-кодом.
  * После «done» продолжает редкие проверки ещё несколько раз — вдруг окно перезагрузилось.
+ * Цикл однократный на экран (флаг autoStarted) — пересборки Compose не плодят параллельные циклы.
  */
-private fun autoOpenLogin(view: WebView, attempt: Int = 0) {
+private fun autoOpenLogin(view: WebView, nav: LoginNavState, attempt: Int = 0) {
     if (attempt > 40) return
     view.evaluateJavascript(AUTO_OPEN_LOGIN_JS) { result ->
-        if (result?.contains("done") == true) {
-            Log.d(TAG, "страница VK ID открыта, ждём сканирования QR ($attempt)")
-            if (attempt < 8) view.postDelayed({ autoOpenLogin(view, attempt + 5) }, POLL_INTERVAL_MS * 3)
-        } else {
-            view.postDelayed({ autoOpenLogin(view, attempt + 1) }, POLL_INTERVAL_MS)
+        when {
+            result?.contains("done") == true -> {
+                Log.d(TAG, "страница VK ID открыта, ждём сканирования QR ($attempt)")
+                nav.set("vkid")
+                if (attempt < 8) view.postDelayed({ autoOpenLogin(view, nav, attempt + 5) }, POLL_INTERVAL_MS * 3)
+            }
+            else -> {
+                if (result?.contains("step") == true) nav.set("login")
+                view.postDelayed({ autoOpenLogin(view, nav, attempt + 1) }, POLL_INTERVAL_MS)
+            }
         }
     }
+}
+
+private fun startAutoLoginOnce(view: WebView, nav: LoginNavState) {
+    if (nav.autoStarted) return
+    nav.autoStarted = true
+    autoOpenLogin(view, nav)
 }
 
 /** Открывает внешние схемы (vk://, vkapi://, http-ссылки на id.vk.com) вне WebView, если умеет. */
@@ -184,6 +218,9 @@ fun BoostyLoginWebView(
     val currentOnLoggedIn by rememberUpdatedState(onLoggedIn)
     var popup by remember { mutableStateOf<WebView?>(null) }
     var loggedIn by remember { mutableStateOf(false) }
+    val nav = remember { LoginNavState() }
+    // Прогресс повторных попыток загрузки (-1 — страница открылась нормально).
+    var loadProgress by remember { mutableStateOf(-1) }
 
     // Раз в POLL_INTERVAL_MS проверяем, появились ли токены после сканирования QR.
     LaunchedEffect(Unit) {
@@ -237,10 +274,63 @@ fun BoostyLoginWebView(
                             }
                             return false
                         }
+
+                        override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
+                            loadProgress = -1
+                            val u = (url ?: "").lowercase()
+                            nav.set(
+                                when {
+                                    u.contains("id.vk.com") || u.contains("oauth.vk.com") -> "vkid"
+                                    u.contains("/signin") -> "login"
+                                    u.startsWith(COOKIE_HOST) -> "home"
+                                    else -> nav.phase
+                                },
+                            )
+                        }
+
+                        override fun onReceivedError(
+                            view: WebView,
+                            request: WebResourceRequest?,
+                            error: android.webkit.WebResourceError?,
+                        ) {
+                            // Ошиблась главная рамка (а не картинка/шрифт) — чиним перезагрузкой.
+                            if (request?.isForMainFrame == true) {
+                                Log.w(TAG, "ошибка загрузки: ${error?.description} (${error?.errorCode}), перезапуск…")
+                                retryLoad(view)
+                            }
+                        }
+
+                        override fun onReceivedHttpError(
+                            view: WebView,
+                            request: WebResourceRequest?,
+                            errorResponse: android.webkit.WebResourceResponse?,
+                        ) {
+                            if (request?.isForMainFrame == true) {
+                                Log.w(TAG, "HTTP ${errorResponse?.statusCode}, перезапуск…")
+                                retryLoad(view)
+                            }
+                        }
+
                         override fun onPageFinished(view: WebView, url: String?) {
                             Log.d(TAG, "загружено: $url")
-                            if (url != null && url.startsWith(COOKIE_HOST)) autoOpenLogin(view)
-                            else if (url != null && url.contains("id.vk.com")) Log.d(TAG, "страница VK ID: ждём QR")
+                            loadProgress = -1
+                            if (url != null && url.startsWith(COOKIE_HOST)) startAutoLoginOnce(view, nav)
+                            else if (url != null && (url.contains("id.vk.com") || url.contains("oauth.vk.com"))) {
+                                nav.set("vkid")
+                                Log.d(TAG, "страница VK ID: ждём QR")
+                            }
+                        }
+
+                        private fun retryLoad(view: WebView) {
+                            if (nav.retries >= 5) {
+                                Log.e(TAG, "не удалось загрузить boosty.to после 5 попыток")
+                                return
+                            }
+                            nav.retries++
+                            view.postDelayed({
+                                loadProgress = nav.retries
+                                view.loadUrl(LOGIN_URL)
+                            }, 2_000L * nav.retries)
                         }
                     }
                     webChromeClient = object : WebChromeClient() {
@@ -267,6 +357,7 @@ fun BoostyLoginWebView(
                                 }
                                 override fun onPageFinished(view: WebView, url: String?) {
                                     Log.d(TAG, "popup загружено: $url")
+                                    if (url != null) nav.set("popup")
                                 }
                             }
                             child.webChromeClient = object : WebChromeClient() {
@@ -283,6 +374,7 @@ fun BoostyLoginWebView(
                     }
                     // На Android TV WebView принимает фокус с пульта (D-pad):
                     // навигация по элементам страницы работает стандартным способом.
+                    // Сразу страница входа — без главной ленты Boosty.
                     loadUrl(LOGIN_URL)
                     post { requestFocus() }
                 }
@@ -300,52 +392,83 @@ fun BoostyLoginWebView(
         // Статус входа + подсказка, чтобы пользователь у телевизора понимал, что делать с QR-кодом.
         LoginStatusOverlay(
             visible = !loggedIn,
-            onPopup = popup != null,
+            nav = nav,
+            loadProgress = loadProgress,
         )
     }
 }
 
 /**
- * Простой статус: пока не открылось popup-окно — «готовим страницу VK ID»,
- * если открылось — «ждём подтверждения в приложении/браузере».
+ * Подсказка внизу экрана: текст зависит от реального шага (загрузка → страница входа →
+ * VK ID → ожидание подтверждения), а при проблемах с сетью показывает прогресс retries.
  */
 @Composable
-private fun LoginStatusOverlay(visible: Boolean, onPopup: Boolean) {
+private fun LoginStatusOverlay(visible: Boolean, nav: LoginNavState, loadProgress: Int) {
     if (!visible) return
     Box(
         modifier = Modifier.fillMaxSize(),
         contentAlignment = Alignment.BottomCenter,
     ) {
-    Box(
-        modifier = Modifier
-            .padding(bottom = 24.dp, start = 48.dp, end = 48.dp)
-            .background(
-                Brush.horizontalGradient(
-                    listOf(Color(0xCC1A0A0A), Color(0xE60E0E10)),
-                ),
-                shape = RoundedCornerShape(14.dp),
-            )
-            .padding(horizontal = 24.dp, vertical = 12.dp),
-    ) {
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(16.dp),
-        ) {
-            Text(if (onPopup) "🔑" else "📱", fontSize = 22.sp)
-            Text(
-                if (onPopup)
-                    "Подтвердите вход в приложении VK или браузере на телефоне — " +
-                        "Boosty TV сохранит ваш аккаунт автоматически."
-                else
-                    "Открываем страницу VK ID с QR-кодом… Если код не появился, " +
-                        "выберите «Войти через VK ID» на пульте.",
-                color = Color(0xFFE8E8EC),
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Medium,
-                modifier = Modifier.weight(1f),
-            )
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            if (loadProgress > 0) {
+                LinearProgressIndicator(
+                    modifier = Modifier
+                        .padding(bottom = 12.dp)
+                        .width(220.dp)
+                        .height(6.dp),
+                    color = Color(0xFFFF6B6B),
+                    trackColor = Color(0x33FFFFFF),
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .padding(bottom = 24.dp, start = 48.dp, end = 48.dp)
+                    .background(
+                        Brush.horizontalGradient(
+                            listOf(Color(0xCC1A0A0A), Color(0xE60E0E10)),
+                        ),
+                        shape = RoundedCornerShape(14.dp),
+                    )
+                    .padding(horizontal = 24.dp, vertical = 12.dp),
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Text(loginHintEmoji(nav.phase, loadProgress), fontSize = 22.sp)
+                    Text(
+                        loginHintText(nav.phase, loadProgress),
+                        color = Color(0xFFE8E8EC),
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
         }
     }
-    }
+}
+
+private fun loginHintEmoji(phase: String, loadProgress: Int): String = when {
+    loadProgress > 0 -> "📡"
+    phase == "vkid" || phase == "popup" -> "🔑"
+    else -> "📱"
+}
+
+private fun loginHintText(phase: String, loadProgress: Int): String = when {
+    loadProgress > 0 ->
+        "Нет связи с boosty.to — повторная попытка $loadProgress из 5…"
+    phase == "vkid" ->
+        "Отсканируйте QR-код камерой телефона (приложение VK или камера) и подтвердите вход — " +
+            "Boosty TV сохранит ваш аккаунт автоматически."
+    phase == "popup" ->
+        "Подтвердите вход в приложении VK или браузере на телефоне — " +
+            "Boosty TV сохранит ваш аккаунт автоматически."
+    phase == "login" ->
+        "Выбираем «Войти через VK ID»… Если кнопка не нажалась, нажмите её на пульте."
+    phase == "home" ->
+        "Открываем страницу входа…"
+    else ->
+        "Загружаем boosty.to…"
 }
 
 /** Читает cookie Boosty: "auth" (JSON с токенами) и "_clientId" (идентификатор устройства). */
